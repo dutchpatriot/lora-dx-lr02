@@ -188,10 +188,17 @@ python3 lora_reset.py
 | File | Description |
 |------|-------------|
 | `lora_gui.py` | Full-duplex GUI application |
+| `lora_chat.py` | Full-duplex CLI chat with usernames |
 | `lora_receiver.py` | CLI receiver script |
 | `lora_sender.py` | CLI sender script |
 | `lora_config.py` | View module configuration |
 | `lora_reset.py` | Reset module if stuck in AT mode |
+| `lora_android.py` | Android/Termux support via usb4a |
+| `lora_termux.py` | Alternative Termux support via termux-usb |
+
+## SDR Listener Support
+
+For emergency broadcast scenarios, passive listeners can receive LoRa transmissions using cheap RTL-SDR dongles (~$25) with gr-lora software. See **[SDR_LISTENER_GUIDE.md](SDR_LISTENER_GUIDE.md)** for setup instructions.
 
 ## Protocol Notes
 
