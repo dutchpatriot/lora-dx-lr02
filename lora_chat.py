@@ -2,6 +2,7 @@
 """
 LoRa Chat - Combined send/receive for DX-LR02 module.
 Single script that does both directions (full duplex).
+Supports usernames so you can tell who's talking.
 """
 
 import serial
@@ -9,12 +10,14 @@ import time
 import sys
 import threading
 import signal
+import socket
 
 PORT = '/dev/ttyUSB0'
 BAUD = 9600
 
 ser = None
 running = True
+username = None
 
 def cleanup(signum=None, frame=None):
     """Clean exit - ensure module is in data mode."""
@@ -59,15 +62,27 @@ def receive_loop():
                     if line and line != 'Power on':
                         timestamp = time.strftime('%H:%M:%S')
                         # Print on new line, then reshow prompt
-                        print(f"\r[{timestamp}] < {line}          ")
-                        print("You> ", end='', flush=True)
+                        print(f"\r[{timestamp}] {line}                    ")
+                        print(f"{username}> ", end='', flush=True)
         except Exception as e:
             if running:
                 print(f"\r[!] Error: {e}")
         time.sleep(0.05)
 
+def get_username():
+    """Get username from user or generate from hostname."""
+    default = socket.gethostname().split('.')[0][:10]  # First 10 chars of hostname
+
+    print(f"Enter your name [{default}]: ", end='', flush=True)
+    try:
+        name = input().strip()
+    except:
+        name = ""
+
+    return name if name else default
+
 def main():
-    global ser
+    global ser, username
 
     # Handle Ctrl+C gracefully
     signal.signal(signal.SIGINT, cleanup)
@@ -76,6 +91,9 @@ def main():
     print("=" * 40)
     print("  LoRa Chat (Full Duplex)")
     print("=" * 40)
+
+    username = get_username()
+    print(f"[*] Joining as: {username}")
     print(f"[*] Connecting to {PORT}...")
 
     try:
@@ -95,14 +113,19 @@ def main():
     rx_thread = threading.Thread(target=receive_loop, daemon=True)
     rx_thread.start()
 
+    # Announce joining
+    ser.write(f"* {username} joined the chat\r\n".encode('utf-8'))
+
     # Main loop - send messages
     while running:
         try:
-            msg = input("You> ")
+            msg = input(f"{username}> ")
             if msg.strip():
-                ser.write((msg + '\r\n').encode('utf-8'))
+                # Format: "username: message"
+                full_msg = f"{username}: {msg}"
+                ser.write((full_msg + '\r\n').encode('utf-8'))
                 timestamp = time.strftime('%H:%M:%S')
-                print(f"[{timestamp}] > {msg}")
+                print(f"[{timestamp}] {full_msg}")
         except EOFError:
             break
 
