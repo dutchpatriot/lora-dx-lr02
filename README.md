@@ -172,6 +172,17 @@ Both modules must have matching settings to communicate:
 
 The sender is still in AT mode. Send `+++\r\n` to exit to data mode.
 
+### Module not responding / ERROR=102
+
+The serial port may be held by a crashed process:
+```bash
+# Kill processes using the port
+sudo fuser -k /dev/ttyUSB0
+
+# Then reset the module
+python3 lora_reset.py
+```
+
 ## File Descriptions
 
 | File | Description |
@@ -180,6 +191,7 @@ The sender is still in AT mode. Send `+++\r\n` to exit to data mode.
 | `lora_receiver.py` | CLI receiver script |
 | `lora_sender.py` | CLI sender script |
 | `lora_config.py` | View module configuration |
+| `lora_reset.py` | Reset module if stuck in AT mode |
 
 ## Protocol Notes
 

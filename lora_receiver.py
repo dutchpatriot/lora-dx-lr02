@@ -15,21 +15,32 @@ BAUD = 9600
 def setup_module(ser):
     """Ensure module is in data mode (not AT mode)"""
     ser.reset_input_buffer()
-    # Send +++ to toggle mode
+
+    # Send +++ to check/toggle mode
     ser.write(b'+++\r\n')
     time.sleep(0.5)
     response = ser.read(ser.in_waiting or 100).decode(errors='ignore')
 
     if 'Entry AT' in response:
-        # We entered AT mode, exit it
+        # We just entered AT mode, exit it
         ser.write(b'+++\r\n')
         time.sleep(0.5)
         ser.read(ser.in_waiting or 100)
         print("Module set to data mode")
     elif 'Exit AT' in response:
-        print("Module already exiting to data mode")
+        # We were in AT mode, now in data mode
+        print("Module was in AT mode, now in data mode")
     else:
-        print(f"Module response: {response.strip()}")
+        # Unknown state, try sending +++ again to be safe
+        time.sleep(0.3)
+        ser.write(b'+++\r\n')
+        time.sleep(0.5)
+        resp2 = ser.read(ser.in_waiting or 100).decode(errors='ignore')
+        if 'Entry AT' in resp2:
+            ser.write(b'+++\r\n')
+            time.sleep(0.5)
+            ser.read(ser.in_waiting or 100)
+        print("Module initialized")
 
     ser.reset_input_buffer()
 
