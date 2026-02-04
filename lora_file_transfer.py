@@ -27,9 +27,9 @@ import threading
 PORT = '/dev/ttyUSB0'
 BAUD = 9600
 
-CHUNK_SIZE = 150      # Bytes of raw data per chunk
+CHUNK_SIZE = 100      # Bytes of raw data per chunk (conservative for SF12)
 MAX_RETRIES = 5       # Retries per chunk
-ACK_TIMEOUT = 10      # Seconds to wait for ACK (long for SF12)
+ACK_TIMEOUT = 15      # Seconds to wait for ACK (long for SF12)
 RECEIVE_DIR = './lora_received'
 
 ser = None
