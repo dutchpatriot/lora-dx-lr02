@@ -233,8 +233,9 @@ def receive_file():
             # Receive chunks
             chunks = {}
             expected_seq = 1
+            transfer_done = False
 
-            while expected_seq <= total_chunks and running:
+            while not transfer_done and running:
                 line = read_line()
                 if line is None:
                     print(f"[!] Timeout waiting for chunk {expected_seq}")
