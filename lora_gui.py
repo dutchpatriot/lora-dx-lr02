@@ -2,17 +2,39 @@
 """
 LoRa Full-Duplex GUI Application for DX-LR02 modules.
 
-A simple chat-like interface for bidirectional LoRa communication.
+A simple chat-like interface for bidirectional LoRa communication
+with file transfer support.
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, filedialog
 import serial
 import serial.tools.list_ports
 import threading
 import queue
 import time
+import os
+import base64
 from datetime import datetime
+
+CHUNK_SIZE = 100      # Bytes per chunk (conservative for SF12)
+MAX_RETRIES = 5       # Retries per chunk
+ACK_TIMEOUT = 15      # Seconds to wait for ACK
+RECEIVE_DIR = './lora_received'
+
+
+def calculate_crc16(data):
+    """Calculate CRC16-CCITT checksum."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = (crc << 1) ^ 0x1021
+            else:
+                crc <<= 1
+            crc &= 0xFFFF
+    return format(crc, '04x')
 
 
 class LoRaModule:
@@ -24,6 +46,12 @@ class LoRaModule:
         self.serial = None
         self.running = False
         self.rx_queue = queue.Queue()
+
+        # File transfer state
+        self.ft_mode = None  # 'send', 'receive', or None
+        self.ft_queue = queue.Queue()  # For ACKs during send
+        self.ft_progress_queue = queue.Queue()  # Progress updates for GUI
+        self.ft_receiving = None  # Dict with receive state
 
     def connect(self):
         """Connect to the module and ensure it's in data mode."""
@@ -73,12 +101,190 @@ class LoRaModule:
                         line, buffer = buffer.split('\n', 1)
                         line = line.strip()
                         if line and line != 'Power on':
-                            self.rx_queue.put(line)
+                            # Route to appropriate queue based on mode
+                            if self.ft_mode == 'send' and line.startswith(('ACK:', 'NACK:', 'OK', 'ABORT')):
+                                self.ft_queue.put(line)
+                            elif line.startswith(('FILE:', 'DATA:', 'DONE:', 'ABORT')):
+                                self._handle_incoming_transfer(line)
+                            else:
+                                self.rx_queue.put(line)
                 time.sleep(0.05)
             except Exception as e:
                 if self.running:
                     self.rx_queue.put(f"[ERROR] {e}")
                 break
+
+    def _handle_incoming_transfer(self, line):
+        """Handle incoming file transfer packets."""
+        if line.startswith('FILE:'):
+            parts = line.split(':')
+            if len(parts) == 4:
+                _, filename, total_str, size_str = parts
+                try:
+                    total = int(total_str)
+                    size = int(size_str)
+                    self.ft_receiving = {
+                        'filename': filename,
+                        'total_chunks': total,
+                        'size': size,
+                        'chunks': {},
+                        'expected_seq': 1
+                    }
+                    self.ft_mode = 'receive'
+                    self.send('ACK:0')
+                    self.ft_progress_queue.put(('start', filename, total, size))
+                except ValueError:
+                    pass
+
+        elif line.startswith('DATA:') and self.ft_receiving:
+            parts = line.split(':', 3)
+            if len(parts) == 4:
+                _, seq_str, claimed_crc, chunk_b64 = parts
+                try:
+                    seq = int(seq_str)
+                    chunk_data = base64.b64decode(chunk_b64)
+                    actual_crc = calculate_crc16(chunk_data)
+
+                    if actual_crc == claimed_crc:
+                        self.ft_receiving['chunks'][seq] = chunk_data
+                        self.send(f'ACK:{seq}')
+                        progress = len(self.ft_receiving['chunks']) / self.ft_receiving['total_chunks']
+                        self.ft_progress_queue.put(('progress', progress, seq))
+                    else:
+                        self.send(f'NACK:{seq}')
+                except Exception:
+                    self.send(f'NACK:{seq_str}')
+
+        elif line.startswith('DONE:') and self.ft_receiving:
+            claimed_crc = line.split(':')[1]
+            chunks = self.ft_receiving['chunks']
+            total = self.ft_receiving['total_chunks']
+
+            if len(chunks) == total:
+                file_data = b''.join(chunks[i] for i in range(1, total + 1))
+                actual_crc = calculate_crc16(file_data)
+
+                if actual_crc == claimed_crc:
+                    # Save file
+                    os.makedirs(RECEIVE_DIR, exist_ok=True)
+                    filename = os.path.basename(self.ft_receiving['filename'])
+                    output_path = os.path.join(RECEIVE_DIR, filename)
+
+                    if os.path.exists(output_path):
+                        base, ext = os.path.splitext(filename)
+                        counter = 1
+                        while os.path.exists(output_path):
+                            output_path = os.path.join(RECEIVE_DIR, f"{base}_{counter}{ext}")
+                            counter += 1
+
+                    with open(output_path, 'wb') as f:
+                        f.write(file_data)
+
+                    self.send('OK')
+                    self.ft_progress_queue.put(('done', output_path, len(file_data)))
+                else:
+                    self.send('ABORT')
+                    self.ft_progress_queue.put(('error', 'CRC mismatch'))
+            else:
+                self.send('ABORT')
+                self.ft_progress_queue.put(('error', f'Missing chunks: {len(chunks)}/{total}'))
+
+            self.ft_receiving = None
+            self.ft_mode = None
+
+        elif line == 'ABORT':
+            self.ft_receiving = None
+            self.ft_mode = None
+            self.ft_progress_queue.put(('error', 'Transfer aborted by sender'))
+
+    def _wait_for_ack(self, expected_seq, timeout=ACK_TIMEOUT):
+        """Wait for ACK with timeout."""
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                line = self.ft_queue.get(timeout=0.1)
+                if line == f'ACK:{expected_seq}':
+                    return True, 'ack'
+                if line == f'NACK:{expected_seq}':
+                    return False, 'nack'
+                if line == 'OK':
+                    return True, 'ok'
+                if line == 'ABORT':
+                    return False, 'abort'
+            except queue.Empty:
+                continue
+        return False, 'timeout'
+
+    def send_file(self, filepath):
+        """Send a file over LoRa. Returns True on success."""
+        if not os.path.exists(filepath):
+            self.ft_progress_queue.put(('error', 'File not found'))
+            return False
+
+        filename = os.path.basename(filepath)
+        filesize = os.path.getsize(filepath)
+
+        with open(filepath, 'rb') as f:
+            data = f.read()
+
+        file_crc = calculate_crc16(data)
+        chunks = [data[i:i+CHUNK_SIZE] for i in range(0, len(data), CHUNK_SIZE)]
+        total_chunks = len(chunks)
+
+        self.ft_mode = 'send'
+        # Clear any stale ACKs
+        while not self.ft_queue.empty():
+            try:
+                self.ft_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self.ft_progress_queue.put(('start', filename, total_chunks, filesize))
+
+        # Send FILE header
+        header = f'FILE:{filename}:{total_chunks}:{filesize}'
+        for retry in range(MAX_RETRIES):
+            self.send(header)
+            success, reason = self._wait_for_ack(0)
+            if success:
+                break
+        else:
+            self.ft_mode = None
+            self.ft_progress_queue.put(('error', 'No response from receiver'))
+            return False
+
+        # Send chunks
+        for seq, chunk in enumerate(chunks, 1):
+            chunk_b64 = base64.b64encode(chunk).decode('ascii')
+            chunk_crc = calculate_crc16(chunk)
+            packet = f'DATA:{seq}:{chunk_crc}:{chunk_b64}'
+
+            for retry in range(MAX_RETRIES):
+                self.send(packet)
+                success, reason = self._wait_for_ack(seq)
+                if success:
+                    break
+            else:
+                self.send('ABORT')
+                self.ft_mode = None
+                self.ft_progress_queue.put(('error', f'Failed to send chunk {seq}'))
+                return False
+
+            progress = seq / total_chunks
+            self.ft_progress_queue.put(('progress', progress, seq))
+
+        # Send DONE
+        for retry in range(MAX_RETRIES):
+            self.send(f'DONE:{file_crc}')
+            success, reason = self._wait_for_ack(0)  # Expects OK
+            if success and reason == 'ok':
+                self.ft_mode = None
+                self.ft_progress_queue.put(('done', filepath, filesize))
+                return True
+
+        self.ft_mode = None
+        self.ft_progress_queue.put(('error', 'No final confirmation'))
+        return False
 
     def get_config(self):
         """Get module configuration (temporarily enters AT mode)."""
@@ -185,6 +391,21 @@ class LoRaGUI:
         # Clear button
         ttk.Button(send_frame, text="Clear", command=self.clear_messages).grid(row=0, column=2, padx=(5, 0))
 
+        # File transfer frame
+        ft_frame = ttk.LabelFrame(main_frame, text="File Transfer", padding="5")
+        ft_frame.grid(row=3, column=0, sticky="ew", pady=(5, 0))
+
+        self.send_file_btn = ttk.Button(ft_frame, text="Send File...", command=self.send_file, state='disabled')
+        self.send_file_btn.grid(row=0, column=0, padx=(0, 10))
+
+        self.ft_status_var = tk.StringVar(value="Ready")
+        ttk.Label(ft_frame, textvariable=self.ft_status_var).grid(row=0, column=1, padx=(0, 10))
+
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress_bar = ttk.Progressbar(ft_frame, variable=self.progress_var, maximum=100, length=200)
+        self.progress_bar.grid(row=0, column=2, sticky="ew")
+        ft_frame.columnconfigure(2, weight=1)
+
     def refresh_ports(self):
         """Refresh the list of available serial ports."""
         ports = [port.device for port in serial.tools.list_ports.comports()]
@@ -219,6 +440,7 @@ class LoRaGUI:
 
             self.connect_btn.configure(text="Disconnect")
             self.send_btn.configure(state='normal')
+            self.send_file_btn.configure(state='normal')
             self.status_var.set("Connected")
             self.status_label.configure(foreground="green")
 
@@ -236,6 +458,7 @@ class LoRaGUI:
 
         self.connect_btn.configure(text="Connect")
         self.send_btn.configure(state='disabled')
+        self.send_file_btn.configure(state='disabled')
         self.status_var.set("Disconnected")
         self.status_label.configure(foreground="red")
 
@@ -244,6 +467,7 @@ class LoRaGUI:
     def poll_rx(self):
         """Poll for received messages and update the GUI."""
         if self.module and self.module.running:
+            # Poll chat messages
             try:
                 while True:
                     message = self.module.rx_queue.get_nowait()
@@ -254,8 +478,61 @@ class LoRaGUI:
             except queue.Empty:
                 pass
 
+            # Poll file transfer progress
+            try:
+                while True:
+                    update = self.module.ft_progress_queue.get_nowait()
+                    self._handle_ft_update(update)
+            except queue.Empty:
+                pass
+
             # Schedule next poll
             self.root.after(100, self.poll_rx)
+
+    def _handle_ft_update(self, update):
+        """Handle file transfer progress update."""
+        msg_type = update[0]
+
+        if msg_type == 'start':
+            _, filename, chunks, size = update
+            self.ft_status_var.set(f"Transferring: {filename}")
+            self.progress_var.set(0)
+            self.send_file_btn.configure(state='disabled')
+            self.add_message(f"[FILE] Starting transfer: {filename} ({size} bytes, {chunks} chunks)", 'system')
+
+        elif msg_type == 'progress':
+            _, progress, seq = update
+            self.progress_var.set(progress * 100)
+
+        elif msg_type == 'done':
+            _, path, size = update
+            self.ft_status_var.set("Ready")
+            self.progress_var.set(100)
+            self.send_file_btn.configure(state='normal')
+            self.add_message(f"[FILE] Transfer complete: {path} ({size} bytes)", 'system')
+            self.root.after(2000, lambda: self.progress_var.set(0))
+
+        elif msg_type == 'error':
+            _, error = update
+            self.ft_status_var.set("Ready")
+            self.progress_var.set(0)
+            self.send_file_btn.configure(state='normal')
+            self.add_message(f"[FILE] Error: {error}", 'error')
+
+    def send_file(self):
+        """Open file dialog and send selected file."""
+        if not self.module or not self.module.running:
+            return
+
+        filepath = filedialog.askopenfilename(
+            title="Select file to send",
+            filetypes=[("All files", "*.*")]
+        )
+
+        if filepath:
+            # Run in background thread to avoid blocking GUI
+            thread = threading.Thread(target=self.module.send_file, args=(filepath,), daemon=True)
+            thread.start()
 
     def send_message(self):
         """Send the message in the entry field."""

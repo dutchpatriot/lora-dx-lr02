@@ -14,7 +14,9 @@ All scripts are standalone Python files. No build system - run directly:
 python3 lora_receiver.py      # Simple receiver
 python3 lora_sender.py        # Simple sender
 python3 lora_chat.py          # Full-duplex CLI chat with usernames
-python3 lora_gui.py           # Full-duplex tkinter GUI
+python3 lora_gui.py           # Full-duplex tkinter GUI (chat + file transfer)
+python3 lora_file_transfer.py send <file>   # Send file over LoRa
+python3 lora_file_transfer.py receive       # Receive files over LoRa
 python3 lora_config.py        # View module AT configuration
 python3 lora_reset.py         # Reset module stuck in AT mode
 ```
@@ -53,6 +55,15 @@ All scripts follow this pattern to ensure data mode:
 - Background thread for receiving messages
 - Main thread handles user input/GUI
 - lora_gui.py uses `queue.Queue` for thread-safe message passing to tkinter
+
+**File Transfer Protocol (lora_file_transfer.py, lora_gui.py):**
+- Stop-and-wait ARQ with ACK/NACK and retries
+- Text-based packets for debugging compatibility
+- Base64 encoding for binary-safe transmission
+- CRC16-CCITT checksums on chunks and full file
+- Protocol: `FILE:name:chunks:size` → `DATA:seq:crc:base64` → `DONE:crc`
+- 100-byte chunks (conservative for SF12), 15s ACK timeout, 5 retries
+- Received files saved to `./lora_received/`
 
 ## Hardware Defaults
 
